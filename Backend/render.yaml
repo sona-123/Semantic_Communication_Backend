@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: semantic-comm-backend
+    env: python
+    plan: free         # change to 'starter' if you need >512 MB RAM
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+    startCommand: gunicorn app:app --bind 0.0.0.0:$PORT --timeout 120
+    pythonVersion: 3.10
+    envVars:
+      - key: MODEL_DIR
+        value: /var/models         # we'll mount a disk here
+    disk:
+      name: model-disk
+      mountPath: /var/models
+      sizeGB: 5
