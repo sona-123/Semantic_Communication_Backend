@@ -12,7 +12,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Load T5 model
 tok = T5Tokenizer.from_pretrained("t5-small")
 model = T5ForConditionalGeneration.from_pretrained("t5-small").to(device).eval()
-MODEL_DIR = os.getenv("MODEL_DIR", "./models") 
+
 MODEL_DIR = "./models"
 
 # Quantization
