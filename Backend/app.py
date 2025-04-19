@@ -120,6 +120,10 @@ def decode_from_hidden(hs, dec_primer):
     )
     return tok.decode(out_ids[0], skip_special_tokens=True)
 
+@app.route("/")
+def index():
+    return "✅ Semantic Communication API is running!"
+
 @app.route('/embedding', methods=['POST'])
 def get_embedding():
     data = request.json
