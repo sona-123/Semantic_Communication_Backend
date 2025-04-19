@@ -13,6 +13,11 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 tok = T5Tokenizer.from_pretrained("t5-small")
 model = T5ForConditionalGeneration.from_pretrained("t5-small").to(device).eval()
 
+print("Warming up T5 model...")
+_ = model.generate(**tok("semantic", return_tensors="pt").to(device))
+print("Model is ready!")
+
+
 MODEL_DIR = "./models"
 
 # Quantization
