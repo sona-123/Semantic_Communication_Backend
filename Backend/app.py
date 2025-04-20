@@ -13,7 +13,7 @@ app = Flask(__name__)
 CORS(app)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Load T5 model
+# Load model once here
 tok = T5Tokenizer.from_pretrained("t5-small")
 model = T5ForConditionalGeneration.from_pretrained("t5-small").to(device).eval()
 
@@ -191,5 +191,8 @@ def visualize_embeddings():
         return jsonify(error=str(e)), 500
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
+    print("Warming up T5 model...")
+    _ = model.generate(**tok("semantic", return_tensors="pt").to(device))
+    print("Model is ready!")
     app.run(debug=True)
