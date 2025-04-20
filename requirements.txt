@@ -10,3 +10,4 @@ numba
 gunicorn==21.2.0
 flask_cors
 matplotlib
+scikit-learn
