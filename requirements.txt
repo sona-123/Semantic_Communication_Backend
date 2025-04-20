@@ -6,4 +6,5 @@ sentencepiece==0.1.99
 numpy==1.26.4
 datasets
 tqdm
+numba
 gunicorn==21.2.0

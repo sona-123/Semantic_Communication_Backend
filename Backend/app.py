@@ -1,12 +1,16 @@
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 import torch
 import numpy as np
 import os
 from transformers import T5Tokenizer, T5ForConditionalGeneration
 from torch import nn
 from transformers.modeling_outputs import BaseModelOutput
+from numpy import dot
+from numpy.linalg import norm
 
 app = Flask(__name__)
+CORS(app)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Load T5 model
@@ -17,63 +21,11 @@ print("Warming up T5 model...")
 _ = model.generate(**tok("semantic", return_tensors="pt").to(device))
 print("Model is ready!")
 
-
 MODEL_DIR = "./models"
 
 # Quantization
 def q8(x): lo, hi = x.min(), x.max(); q = np.round((x - lo) * 255 / (hi - lo)).astype(np.uint8); return q, (lo, hi)
 def dq8(q, lohi): lo, hi = lohi; return q.astype(np.float32) * (hi - lo) / 255 + lo
-
-# Conv FEC
-POLY = (0o133, 0o171)
-K = 7
-NS = 1 << (K - 1)
-
-def conv_encode(bitstr):
-    state = 0; out = []
-    for b in bitstr:
-        bit = int(b); state = ((state << 1) | bit) & (NS - 1)
-        for g in POLY:
-            out.append(str(bin(state & g).count("1") & 1))
-    return "".join(out)
-
-def viterbi_decode(rx_bits):
-    n_bits = len(rx_bits) // 2
-    INF = 1e9
-    pm = np.full(NS, INF, dtype=np.int32)
-    pm[0] = 0
-    surv = np.zeros((n_bits, NS), dtype=np.int8)
-    branch = np.zeros((NS, 2), dtype=np.uint8)
-    for s in range(NS):
-        for u in (0, 1):
-            ns = ((s << 1) | u) & (NS - 1)
-            coded = [(bin(ns & g).count("1") & 1) for g in POLY]
-            branch[s, u] = (coded[0] << 1) | coded[1]
-
-    for i in range(n_bits):
-        r_sym = int(rx_bits[2 * i:2 * i + 2], 2)
-        pm_next = np.full(NS, INF, dtype=np.int32)
-        surv_sym = np.zeros(NS, dtype=np.int8)
-        for s in range(NS):
-            if pm[s] >= INF: continue
-            for u in (0, 1):
-                ns = ((s << 1) | u) & (NS - 1)
-                exp_sym = branch[s, u]
-                dist = ((r_sym >> 1) ^ (exp_sym >> 1)) + ((r_sym & 1) ^ (exp_sym & 1))
-                metric = pm[s] + dist
-                if metric < pm_next[ns]:
-                    pm_next[ns] = metric
-                    surv_sym[ns] = (u << 6) | s
-        pm = pm_next
-        surv[i] = surv_sym
-
-    state = pm.argmin()
-    decoded = []
-    for i in range(n_bits - 1, -1, -1):
-        up = surv[i, state]
-        decoded.append(str(up >> 6))
-        state = up & (NS - 1)
-    return "".join(reversed(decoded))
 
 # BPSK
 def bpsk_modulate(bitstr):
@@ -90,6 +42,11 @@ def rayleigh_mmse(sig, snr_db):
 def bpsk_demod_hard(sym):
     return "".join("1" if x.real > 0 else "0" for x in sym)
 
+def cosine_similarity(a, b):
+    a = np.array(a).flatten()
+    b = np.array(b).flatten()
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-8))  # small epsilon to avoid division by zero
+
 # Denoiser model
 class Denoiser(nn.Module):
     def __init__(self, d=512):
@@ -102,6 +59,8 @@ class Denoiser(nn.Module):
 
     def forward(self, x): return self.net(x)
 
+
+
 def load_denoiser_for_snr(snr_db):
     den = Denoiser().to(device)
     path = os.path.join(MODEL_DIR, f"t5_denoiser_snr_{snr_db}.pth")
@@ -109,21 +68,11 @@ def load_denoiser_for_snr(snr_db):
     den.eval()
     return den
 
+
+
 def get_hidden(sentence):
     enc = tok(sentence, return_tensors="pt").to(device)
     return model.encoder(**enc).last_hidden_state.detach().cpu().numpy(), enc
-
-def decode_from_hidden(hs, dec_primer):
-    hs_t = torch.tensor(hs, dtype=torch.float32, device=device)
-    enc_out = BaseModelOutput(last_hidden_state=hs_t)
-    out_ids = model.generate(
-        encoder_outputs=enc_out,
-        decoder_input_ids=dec_primer,
-        max_length=hs.shape[1] + 10,
-        num_beams=5,
-        early_stopping=True
-    )
-    return tok.decode(out_ids[0], skip_special_tokens=True)
 
 @app.route("/")
 def index():
@@ -145,10 +94,9 @@ def get_noisy_embedding():
     flat = hs.flatten()
     q, lohi = q8(flat)
     bits = "".join(f"{b:08b}" for b in q)
-    fec_bits = conv_encode(bits)
-    tx = bpsk_modulate(fec_bits)
+    tx = bpsk_modulate(bits)
     eq = rayleigh_mmse(tx, snr)
-    rx_bits = viterbi_decode(bpsk_demod_hard(eq))
+    rx_bits = bpsk_demod_hard(eq)
     rx_bytes = np.frombuffer(bytes(int(rx_bits[i:i + 8], 2) for i in range(0, len(rx_bits), 8)), dtype=np.uint8)
     H_noisy = dq8(rx_bytes, lohi).reshape(hs.shape)
     return jsonify(noisy_embedding=H_noisy.tolist())
@@ -159,30 +107,22 @@ def get_reconstructed_embedding():
     noisy_embedding = np.array(data["noisy_embedding"])
     snr = int(data["snr"])
     den = load_denoiser_for_snr(snr)
-    H_t = torch.tensor(noisy_embedding, dtype=torch.float32, device=device)
+    H_t = torch.tensor(noisy_embedding, dtype=torch.float32, device=device)  # ❌ no .half()
     H_den = den(H_t).unsqueeze(0).detach().cpu().numpy()
     return jsonify(reconstructed_embedding=H_den.tolist())
 
 @app.route('/decode', methods=['POST'])
 def decode():
     data = request.json
-
-    # 1️⃣  squeeze away excess 1‑dims → result is either 2‑D or 3‑D
     emb = np.squeeze(np.array(data["reconstructed_embedding"]))
-
-    # 2️⃣  guarantee a batch‑dim
-    if emb.ndim == 2:          # [seq, hidden]
-        emb = emb[np.newaxis]  # -> [1, seq, hidden]
-    elif emb.ndim != 3:        # any other rank is an error
+    if emb.ndim == 2:
+        emb = emb[np.newaxis]
+    elif emb.ndim != 3:
         return jsonify(error=f"Bad embedding shape {emb.shape}"), 400
-
     hs_t = torch.tensor(emb, dtype=torch.float32, device=device)
     enc_out = BaseModelOutput(last_hidden_state=hs_t)
-
-    # primer token from the original sentence
     enc = tok(data["original_text"], return_tensors="pt").to(device)
     primer = enc["input_ids"][:, :1]
-
     out_ids = model.generate(
         encoder_outputs=enc_out,
         decoder_input_ids=primer,
@@ -192,6 +132,64 @@ def decode():
     )
     decoded = tok.decode(out_ids[0], skip_special_tokens=True)
     return jsonify(decoded_text=decoded)
+@app.route('/similarity', methods=['POST'])
+def get_similarity():
+    data = request.json
+    if "original_embedding" not in data or "reconstructed_embedding" not in data:
+        return jsonify(error="Both 'original_embedding' and 'reconstructed_embedding' must be provided."), 400
+
+    original = np.array(data["original_embedding"])
+    reconstructed = np.array(data["reconstructed_embedding"])
+    sim = cosine_similarity(original, reconstructed)
+
+    return jsonify(similarity=sim)
+import io
+import base64
+from flask import send_file
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+@app.route('/visualize_embeddings', methods=['POST'])
+def visualize_embeddings():
+    data = request.json
+    try:
+        original = np.array(data["original_embedding"]).reshape(-1, 512)
+        noisy = np.array(data["noisy_embedding"]).reshape(-1, 512)
+        reconstructed = np.array(data["reconstructed_embedding"]).reshape(-1, 512)
+
+        # Combine for PCA
+        combined = np.vstack([original, noisy, reconstructed])
+        reduced = PCA(n_components=2).fit_transform(combined)
+
+        N = original.shape[0]
+        orig_2d = reduced[:N]
+        noisy_2d = reduced[N:2*N]
+        rec_2d = reduced[2*N:]
+
+        # Plotting
+        plt.figure(figsize=(10, 6))
+        for i in range(N):
+            x = [orig_2d[i, 0], noisy_2d[i, 0], rec_2d[i, 0]]
+            y = [orig_2d[i, 1], noisy_2d[i, 1], rec_2d[i, 1]]
+            plt.plot(x, y, marker='o', linestyle='-', linewidth=1.2)
+
+        plt.title("Embedding Flow: Original → Noisy → Reconstructed")
+        plt.xlabel("PCA Dim 1")
+        plt.ylabel("PCA Dim 2")
+        plt.grid(True)
+
+        # Save to memory buffer
+        buf = io.BytesIO()
+        plt.tight_layout()
+        plt.savefig(buf, format='png')
+        buf.seek(0)
+        plt.close()
+
+        return send_file(buf, mimetype='image/png')
+
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
 
 if __name__ == '__main__':
     app.run(debug=True)
