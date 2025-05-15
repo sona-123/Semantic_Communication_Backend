@@ -32,12 +32,30 @@ def bpsk_modulate(bitstr):
     return np.array([1.0 if b == "1" else -1.0 for b in bitstr], dtype=np.complex64)
 
 def rayleigh_mmse(sig, snr_db):
+    # Convert SNR from dB to linear scale
+    print("Signal recieved (after modulation):", sig)
     snr_lin = 10 ** (snr_db / 10)
+    
+    # Compute the noise standard deviation based on SNR
     σ = 1 / np.sqrt(2 * snr_lin)
+    
+    # Rayleigh fading channel (h) and noise (n)
     h = (np.random.randn(*sig.shape) + 1j * np.random.randn(*sig.shape)).astype(np.complex64) / np.sqrt(2)
     n = (np.random.randn(*sig.shape) + 1j * np.random.randn(*sig.shape)).astype(np.complex64) * σ
+    
+    # Received signal (signal + noise)
     r = h * sig + n
-    return (np.conjugate(h) / (np.abs(h) ** 2 + 1 / snr_lin)) * r
+    
+    # MMSE Equalizer - The actual signal recovery step
+    equalized_signal = (np.conjugate(h) / (np.abs(h) ** 2 + 1 / snr_lin)) * r
+    
+    # Optionally, print the received and equalized signals
+    print("Received Signal (after Rayleigh noise):", r)
+    print("Equalized Signal (after MMSE):", equalized_signal)
+    
+    # Return the equalized signal
+    return equalized_signal
+
 
 def bpsk_demod_hard(sym):
     return "".join("1" if x.real > 0 else "0" for x in sym)
@@ -94,12 +112,18 @@ def get_noisy_embedding():
     flat = hs.flatten()
     q, lohi = q8(flat)
     bits = "".join(f"{b:08b}" for b in q)
+    # print("After Quantization,",bits)
     tx = bpsk_modulate(bits)
+    # print("After Modulation : ", tx)
     eq = rayleigh_mmse(tx, snr)
     rx_bits = bpsk_demod_hard(eq)
+    # print("After demodulation, ", rx_bits)
     rx_bytes = np.frombuffer(bytes(int(rx_bits[i:i + 8], 2) for i in range(0, len(rx_bits), 8)), dtype=np.uint8)
     H_noisy = dq8(rx_bytes, lohi).reshape(hs.shape)
-    return jsonify(noisy_embedding=H_noisy.tolist())
+    # print("After dequantization,", H_noisy)
+    return jsonify(noisy_embedding=H_noisy.tolist(),
+    original_bitstream=bits,           # 👈 original bits before modulation
+    noisy_bitstream=rx_bits)
 
 @app.route('/reconstructed_embedding', methods=['POST'])
 def get_reconstructed_embedding():
